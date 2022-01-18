@@ -3,7 +3,7 @@
 This solution is designed to automatically synchronize private IP addresses for ENIs associated with a Security Group
 to a Managed Prefix List in the same or different region as the Security Group. This can enable strict IP based filtering across region or when crossing a Transit Gateway, as well as when using a middle box appliance in a VPC where security group referencing is not supported. 
 
-##Getting Started
+## Getting Started
 
  1.  Launch the CloudFormation Template making sure to fill in the SNSRecipientEmail Parameter used to email error notices.
     (note: The CloudFormation Template must be launched in each region you want to reference Security Groups in but is not
@@ -13,7 +13,7 @@ to a Managed Prefix List in the same or different region as the Security Group. 
  3.  Repeat Step 2 for each Security group to Region pairing you which to configure synchronizations for
  4.  Enable the Event Bridge rule to start synchronizing the security group to the prefix list on a schedule.
 
-##Function Descriptions
+## Function Descriptions
 
  - Bulk-Batch-Initiator: This Function reads all mapping of SG, Region, Prefix list combinations as stored in Parameter Store and 
     invokes the Batch-Sync lambda for each mapping.
@@ -21,7 +21,7 @@ to a Managed Prefix List in the same or different region as the Security Group. 
  - OnBoard: This Function creates a Prefix List in the specified region, and stores the mapping of Security Group, Prefix List and
     region in Parameter store. It also does an initial population of the Prefix List with IPs associated with the Security Group.
    
-##Considerations
+## Considerations
 
  - When launching the CloudFormation, the EventBridge Rule that triggers the Bulk Batch Initiator function is created in a disabled state to avoid unwanted charges. Make sure to enable the rule after creating a mapping for the first time with the OnBoarding function so the prefix lists will stay in sync with the security group(s) membership(s). 
  - IPv6 is not supported in this solution today.
