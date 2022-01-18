@@ -1,0 +1,497 @@
+#
+# Copyright Amazon.com, Inc. or its affiliates. All Rights Reserved.
+# SPDX-License-Identifier: MIT-0
+#
+# Permission is hereby granted, free of charge, to any person obtaining a copy of this
+# software and associated documentation files (the "Software"), to deal in the Software
+# without restriction, including without limitation the rights to use, copy, modify,
+# merge, publish, distribute, sublicense, and/or sell copies of the Software, and to
+# permit persons to whom the Software is furnished to do so.
+#
+# THE SOFTWARE IS PROVIDED "AS IS", WITHOUT WARRANTY OF ANY KIND, EXPRESS OR IMPLIED,
+# INCLUDING BUT NOT LIMITED TO THE WARRANTIES OF MERCHANTABILITY, FITNESS FOR A
+# PARTICULAR PURPOSE AND NONINFRINGEMENT. IN NO EVENT SHALL THE AUTHORS OR COPYRIGHT
+# HOLDERS BE LIABLE FOR ANY CLAIM, DAMAGES OR OTHER LIABILITY, WHETHER IN AN ACTION
+# OF CONTRACT, TORT OR OTHERWISE, ARISING FROM, OUT OF OR IN CONNECTION WITH THE
+# SOFTWARE OR THE USE OR OTHER DEALINGS IN THE SOFTWARE.
+#
+
+
+AWSTemplateFormatVersion: "2010-09-09"
+
+Description:
+  This CloudFormation Template launches all of the necessary resources to use AutoSG2PL a tool to automatically synchronize private IP addresses for ENIs associated to a VPC Security Group to a Customer Managed Prefix List in the same or a different region.
+
+Metadata:
+  AWS::CloudFormation::Interface:
+    ParameterGroups:
+      -
+        Label:
+          default: "Global Configuration"
+        Parameters:
+          - PercentSafeThresholdSGQuota
+          - BaseSafeThresholdSGQuota
+          - CodeSourceBucket
+      -
+        Label:
+          default: "Logging Configuration"
+        Parameters:
+          - SNSTopicName
+          - SNSRecipientEmail
+          - LogLevel
+      -
+        Label:
+          default: "Bulk Batch Initiator Lambda Function Configuration"
+        Parameters:
+          - AutoInvokeInterval
+
+
+Parameters:
+  SNSTopicName:
+    Type: String
+    Default: AutoSG2PL-Log
+    Description: The display name that will be used for the SNS topic created used to notify of warnings and errors when running the AutoSG2PL automation.
+  SNSRecipientEmail:
+    Type: String
+    Description: This is a properly formatted email address that should be emailed by SNS in the case of a warning or error that occurs during the AutoSG2PL processes.
+  BaseSafeThresholdSGQuota:
+    Type: Number
+    Description: This is a minimum absolute value for the difference between the number of prefixes in the larges prefix list and the current quota for rules per Security Group before a warning message is sent to the SNS topic. (see documenation for more info)
+    Default: 10
+  PercentSafeThresholdSGQuota:
+    Type: Number
+    Description: This is a percentage for the difference between the number of prefixes in the larges prefix list and the current quota for rules per Security Group before a warning message is sent to the SNS topic. (see documenation for more info)
+    Default: 10
+  LogLevel:
+    Type: Number
+    Description: This sets the log level for the lambda functions. Use a number between 1-3 with 1 being INFO, 2 being WARN and 3 being CRITICAL
+    Default: 2
+    MinValue: 1
+    MaxValue: 3
+  AutoInvokeInterval:
+    Type: String
+    Description: This is the interval at which the Bulk Batch Initiator Function is run. Please specify a numberic value and either minute, hour or day for 1 or minutes, hours or days for greater than 1. Auto Invocation is disabled by default on create and must be enabled manually.
+    Default: "5 minutes"
+    AllowedPattern: ^((1 (minute|hour|day))|(([2-9]|[1-9]([0-9]){1,2}) (minutes|hours|days)))$
+  CodeSourceBucket:
+    Default: autosg2pl
+    Description: This is the bucket where the Lambda ZIPs are copied from. The default "autosg2pl" is a public bucket with the latest version of the solution.
+    Type: String
+
+Resources:
+  # SNS Topic for Error Notifications
+  SNSLogTopic:
+    Type: AWS::SNS::Topic
+    Properties:
+      DisplayName: !Ref SNSTopicName
+      Subscription:
+        - Endpoint: !Ref SNSRecipientEmail
+          Protocol: "email"
+
+  # S3 Bucket for Lambda Function Code to reside locally
+  LambdaZipsBucket:
+    Type: "AWS::S3::Bucket"
+
+  # Role for custom resource Lambda Function to copy code to local bucket
+  CopyRole:
+    DependsOn: LambdaZipsBucket
+    Type: AWS::IAM::Role
+    Properties:
+      Path: /
+      AssumeRolePolicyDocument:
+        Version: 2012-10-17
+        Statement:
+          - Effect: Allow
+            Principal:
+              Service: lambda.amazonaws.com
+            Action: sts:AssumeRole
+      Policies:
+        - PolicyName: ConfigPolicy
+          PolicyDocument:
+            Version: 2012-10-17
+            Statement:
+              - Sid: Logging
+                Effect: Allow
+                Action: logs:*
+                Resource: '*'
+              - Sid: S3Get
+                Effect: Allow
+                Action:
+                  - s3:GetObject
+                Resource:
+                  - !Join [ "", [ "arn:aws:s3:::", !Ref CodeSourceBucket, "/*" ] ]
+                  - !Join [ "", [ "arn:aws:s3:::", !Ref LambdaZipsBucket, "/*" ] ]
+              - Sid: S3list
+                Effect: Allow
+                Action:
+                  - s3:ListBucket
+                Resource:
+                  - !Join [ "", [ "arn:aws:s3:::", !Ref CodeSourceBucket ] ]
+                  - !Join [ "", [ "arn:aws:s3:::", !Ref LambdaZipsBucket ] ]
+              - Sid: S3Put
+                Effect: Allow
+                Action:
+                  - s3:PutObject
+                  - s3:DeleteObject
+                Resource:
+                  - !Join [ "", [ "arn:aws:s3:::", !Ref LambdaZipsBucket, "/*" ] ]
+
+  # Lambda Function to move code from source S3 bucket to local bucket
+  CopyZipsFunction:
+    DependsOn: CopyRole
+    Type: AWS::Lambda::Function
+    Properties:
+      Description: Copies Lambda function zips from Source bucket to local bucket
+      Handler: index.lambda_handler
+      Runtime: python3.8
+      Role: !GetAtt CopyRole.Arn
+      Timeout: 240
+      Code:
+        ZipFile: |
+          import boto3
+          import cfnresponse
+          import threading
+          import logging
+          def timeout(event, context):
+              logging.error('Execution is about to time out, sending failure response to CloudFormation')
+              cfnresponse.send(event, context, cfnresponse.FAILED, {}, None)
+          def lambda_handler(event, context):
+              timer = threading.Timer((context.get_remaining_time_in_millis() / 1000.00) - 0.5, timeout, args=[event, context])
+              timer.start()
+              status = cfnresponse.SUCCESS
+              try:
+                  s3_resource = boto3.resource('s3')
+                  client = boto3.client('s3')
+                  new_bucket_name = event['ResourceProperties']['DestBucket']
+                  bucket_to_copy = event['ResourceProperties']['CodeSourceBucket']
+                  if event['RequestType'] == 'Create':
+                      for key in client.list_objects(Bucket=bucket_to_copy)['Contents']:
+                          files = key['Key']
+                          logging.info(files)
+                          copy_source = {'Bucket': bucket_to_copy,'Key': files}
+                          s3_resource.meta.client.copy(copy_source, new_bucket_name, files)
+                          logging.info(files)
+                  elif event['RequestType'] == 'Delete':
+                      for key in client.list_objects(Bucket=new_bucket_name)['Contents']:
+                          files = key['Key']
+                          logging.info(files)
+                          client.delete_object(Bucket=new_bucket_name, Key=files)
+                          logging.info(files)
+              except Exception as e:
+                  logging.error('Exception: %s' % e, exc_info=True)
+                  status = cfnresponse.FAILED
+              finally:
+                  timer.cancel()
+                  cfnresponse.send(event, context, status, {}, None)
+
+  # Custom Resource
+  CopyZips:
+    DependsOn: CopyZipsFunction
+    Type: AWS::CloudFormation::CustomResource
+    Properties:
+      ServiceToken: !GetAtt CopyZipsFunction.Arn
+      DestBucket: !Ref LambdaZipsBucket
+      CodeSourceBucket: !Ref CodeSourceBucket
+
+  # Batch Sync Lambda IAM Role
+  SG2PLBatchSyncRole:
+    DependsOn: CopyZips
+    Type: AWS::IAM::Role
+    Properties:
+      AssumeRolePolicyDocument:
+        Version: '2012-10-17'
+        Statement:
+          - Effect: Allow
+            Principal:
+              Service: lambda.amazonaws.com
+            Action: sts:AssumeRole
+      Policies:
+        - PolicyName: 'AutoSG2PL-Batch-Sync-Lambda'
+          PolicyDocument:
+            Version: 2012-10-17
+            Statement:
+              - Sid: AllResourceRules
+                Effect: Allow
+                Action:
+                  - 'logs:CreateLogGroup'
+                  - 'ec2:DescribeNetworkInterfaces'
+                  - 'ec2:GetManagedPrefixListEntries'
+                  - 'servicequotas:GetServiceQuota'
+                  - 'ec2:ModifyManagedPrefixList'
+                  - 'ec2:DescribeManagedPrefixLists'
+                Resource: '*'
+              - Sid: SNSRule
+                Effect: Allow
+                Action:
+                  - 'sns:Publish'
+                Resource: !Ref SNSLogTopic
+              - Sid: CWLogsRules
+                Effect: Allow
+                Action:
+                  - 'logs:CreateLogStream'
+                  - 'logs:PutLogEvents'
+                Resource: !Join ["", ["arn:aws:logs:*:*:log-group:/aws/lambda/AutoSG2PL-Batch-Sync:*"]]
+
+  # Batch Sync Lambda Function
+  SG2PLBatchSyncFunction:
+    DependsOn: SG2PLBatchSyncRole
+    Type: AWS::Lambda::Function
+    Properties:
+      Description: This function sets up a new prefix list in the specified region and the configuration items needed to automate the synchronization of the specified Security Group to the new prefix list. It also runs an intial sync.
+      Environment:
+        Variables:
+          log_level: !Ref LogLevel
+          log_sns_arn: !Ref SNSLogTopic
+          security_group_quota_padding_percentage: !Ref PercentSafeThresholdSGQuota
+          security_group_quote_quota_code: 'L-0EA8095F'
+          security_group_quote_service_code: 'vpc'
+      FunctionName: 'AutoSG2PL-Batch-Sync'
+      Handler: SG2PL-Batchsync.lambda_handler
+      MemorySize: 128
+      Role: !GetAtt 'SG2PLBatchSyncRole.Arn'
+      Runtime: python3.8
+      Timeout: 15
+      Code:
+        S3Bucket: !Ref LambdaZipsBucket
+        S3Key: 'SG2PL-Batch-Sync.zip'
+
+  # OnBoarding Lambda IAM Role
+  SG2PLOnBoardRole:
+    DependsOn: SG2PLBatchSyncFunction
+    Type: AWS::IAM::Role
+    Properties:
+      AssumeRolePolicyDocument:
+        Version: '2012-10-17'
+        Statement:
+          - Effect: Allow
+            Principal:
+              Service: lambda.amazonaws.com
+            Action: sts:AssumeRole
+      Policies:
+        - PolicyName: 'AutoSG2PL-OnBoard-Lambda'
+          PolicyDocument:
+            Version: 2012-10-17
+            Statement:
+              - Sid: AllResourceRules
+                Effect: Allow
+                Action:
+                  - 'logs:CreateLogGroup'
+                  - 'ec2:DescribeNetworkInterfaces'
+                  - 'ec2:CreateManagedPrefixList'
+                  - 'servicequotas:GetServiceQuota'
+                  - 'ec2:DescribeSecurityGroups'
+                Resource: '*'
+              - Sid: LambdaInvokeRule
+                Effect: Allow
+                Action:
+                  - 'lambda:InvokeFunction'
+                Resource: !GetAtt SG2PLBatchSyncFunction.Arn
+              - Sid: ParameterStoreRules
+                Effect: Allow
+                Action:
+                  - 'ssm:PutParameter'
+                  - 'ssm:GetParameters'
+                Resource: !Join ["", ["arn:",!Ref AWS::Partition, ":ssm:", !Ref "AWS::Region", ":",!Ref "AWS::AccountId", ":parameter/AutoSG2PL/SGs/*"]]
+              - Sid: SNSRule
+                Effect: Allow
+                Action:
+                  - 'sns:Publish'
+                Resource: !Ref SNSLogTopic
+              - Sid: CWLogsRules
+                Effect: Allow
+                Action:
+                  - 'logs:CreateLogStream'
+                  - 'logs:PutLogEvents'
+                Resource: !Join ["", ["arn:",!Ref AWS::Partition, ":logs:", !Ref "AWS::Region", ":",!Ref "AWS::AccountId", ":log-group:/aws/lambda/AutoSG2PL-OnBoard:*"]]
+
+  # OnBoarding Lambda Function
+  SG2PLOnBoardFunction:
+    DependsOn: SG2PLOnBoardRole
+    Type: AWS::Lambda::Function
+    Properties:
+      Description: This function sets up a new prefix list in the specified region and the configuration items needed to automate the synchronization of the specified Security Group to the new prefix list. It also runs an intial sync.
+      Environment:
+        Variables:
+          log_level: !Ref LogLevel
+          log_sns_arn: !Ref SNSLogTopic
+          parameter_store_path: '/AutoSG2PL/SGs'
+          security_group_quota_padding_base: !Ref BaseSafeThresholdSGQuota
+          security_group_quota_padding_percentage: !Ref PercentSafeThresholdSGQuota
+          security_group_quote_quota_code: 'L-0EA8095F'
+          security_group_quote_service_code: 'vpc'
+          batch_sync_function_name: !Ref SG2PLBatchSyncFunction
+      FunctionName: 'AutoSG2PL-OnBoard'
+      Handler: SG2PL-Onboard.lambda_handler
+      MemorySize: 128
+      Role: !GetAtt 'SG2PLOnBoardRole.Arn'
+      Runtime: python3.8
+      Timeout: 15
+      Code:
+        S3Bucket: !Ref LambdaZipsBucket
+        S3Key: 'SG2PL-Onboard.zip'
+
+  # Bulk Batch Initiator Lambda IAM Role
+  SG2PLBulkBatchInitiatorRole:
+    DependsOn: SG2PLOnBoardFunction
+    Type: AWS::IAM::Role
+    Properties:
+      AssumeRolePolicyDocument:
+        Version: '2012-10-17'
+        Statement:
+          - Effect: Allow
+            Principal:
+              Service: lambda.amazonaws.com
+            Action: sts:AssumeRole
+      Policies:
+        - PolicyName: 'AutoSG2PL-Bulk-Batch-Initiator-Lambda'
+          PolicyDocument:
+            Version: 2012-10-17
+            Statement:
+              - Sid: AllResourceRules
+                Effect: Allow
+                Action:
+                  - 'logs:CreateLogGroup'
+                  - 'ec2:DescribeNetworkInterfaces'
+                  - 'ec2:CreateManagedPrefixList'
+                Resource: '*'
+              - Sid: LambdaInvokeRule
+                Effect: Allow
+                Action:
+                  - 'lambda:InvokeFunction'
+                Resource: !GetAtt SG2PLBatchSyncFunction.Arn
+              - Sid: ParameterStoreRule
+                Effect: Allow
+                Action:
+                  - 'ssm:GetParametersByPath'
+                Resource: !Join [ "", [ "arn:",!Ref AWS::Partition, ":ssm:", !Ref "AWS::Region", ":",!Ref "AWS::AccountId", ":parameter/AutoSG2PL/SGs*" ] ]
+              - Sid: SNSRule
+                Effect: Allow
+                Action:
+                  - 'sns:Publish'
+                Resource: !Ref SNSLogTopic
+              - Sid: CWLogsRules
+                Effect: Allow
+                Action:
+                  - 'logs:CreateLogStream'
+                  - 'logs:PutLogEvents'
+                Resource: !Join ["", ["arn:",!Ref AWS::Partition, ":logs:", !Ref "AWS::Region", ":",!Ref "AWS::AccountId", ":log-group:/aws/lambda/AutoSG2PL-Bulk-Batch-Initiator:*"]]
+
+  # Bulk Batch Initiator Lambda Function
+  SG2PLBulkBatchInitiatorFunction:
+    DependsOn: SG2PLBulkBatchInitiatorRole
+    Type: AWS::Lambda::Function
+    Properties:
+      Description: This function sets up a new prefix list in the specified region and the configuration items needed to automate the synchronization of the specified Security Group to the new prefix list. It also runs an intial sync.
+      Environment:
+        Variables:
+          log_level: !Ref LogLevel
+          log_sns_arn: !Ref SNSLogTopic
+          parameter_store_path: '/AutoSG2PL/SGs'
+          batch_sync_function_name: !Ref SG2PLBatchSyncFunction
+      FunctionName: 'AutoSG2PL-Bulk-Batch-Initiator'
+      Handler: SG2PL-BulkBatchInitiator.lambda_handler
+      MemorySize: 128
+      Role: !GetAtt 'SG2PLBulkBatchInitiatorRole.Arn'
+      Runtime: python3.8
+      Timeout: 15
+      Code:
+        S3Bucket: !Ref LambdaZipsBucket
+        S3Key: 'SG2PL-Bulk-Batch-Initiator.zip'
+
+  # Scheduled Event Trigger for Bulk Batch Initiator
+  ScheduledRule:
+    DependsOn: SG2PLBulkBatchInitiatorFunction
+    Type: AWS::Events::Rule
+    Properties:
+      Description: "AutoSG2PL-Bulk-Batch-Initiator-Schedule"
+      ScheduleExpression: !Join ["", ["rate(", !Ref AutoInvokeInterval, ")"]]
+      State: "DISABLED"
+      Targets:
+        - Arn: !GetAtt SG2PLBulkBatchInitiatorFunction.Arn
+          Id: SG2PLBulkBatchInitiatorFunction
+
+  PermissionForEventsToInvokeLambda:
+    DependsOn: ScheduledRule
+    Type: AWS::Lambda::Permission
+    Properties:
+      FunctionName: !Ref SG2PLBulkBatchInitiatorFunction
+      Action: "lambda:InvokeFunction"
+      Principal: "events.amazonaws.com"
+      SourceArn: !GetAtt ScheduledRule.Arn
+
+  # CloudWatch Alarms for the Lambda Functions error rates
+  BatchSyncLambdaCWAlarm:
+    DependsOn: SG2PLBatchSyncFunction
+    Type: AWS::CloudWatch::Alarm
+    Properties:
+      AlarmActions:
+        - !Ref SNSLogTopic
+      AlarmDescription: "This alarm triggers when an error occurs on the AutoSG2PL-Batch-Sync Function."
+      AlarmName: "AutoSG2PL-Batch-Sync-Lambda-Failure"
+      ComparisonOperator: "GreaterThanThreshold"
+      Dimensions:
+        - Name: FunctionName
+          Value: !Ref SG2PLBatchSyncFunction
+      DatapointsToAlarm: 1
+      EvaluationPeriods: 1
+      InsufficientDataActions:
+        - !Ref SNSLogTopic
+      MetricName: "Errors"
+      Namespace: "AWS/Lambda"
+      Period: 60
+      Statistic: Maximum
+      Threshold: 0
+      TreatMissingData: notBreaching
+
+  BulkBatchInitiatorLambdaCWAlarm:
+    DependsOn: SG2PLBulkBatchInitiatorFunction
+    Type: AWS::CloudWatch::Alarm
+    Properties:
+      AlarmActions:
+        - !Ref SNSLogTopic
+      AlarmDescription: "This alarm triggers when an error occurs on the AutoSG2PL-Bulk-Batch-Initiator Function."
+      AlarmName: "AutoSG2PL-Bulk-Batch-Initiator-Lambda-Failure"
+      ComparisonOperator: "GreaterThanThreshold"
+      Dimensions:
+        - Name: FunctionName
+          Value: !Ref SG2PLBulkBatchInitiatorFunction
+      DatapointsToAlarm: 1
+      EvaluationPeriods: 1
+      InsufficientDataActions:
+        - !Ref SNSLogTopic
+      MetricName: "Errors"
+      Namespace: "AWS/Lambda"
+      Period: 60
+      Statistic: Maximum
+      Threshold: 0
+      TreatMissingData: notBreaching
+
+Outputs:
+  EVENTBRIDGEURL:
+    Description: This is the URL to get to the EvenBridge Console to enable the scheduled invocation of the Bulk Batch Initiator Lambda Function.
+    Value: !Join ["", ["https://", !Ref "AWS::Region", ".console.aws.amazon.com/events/home?region=", !Ref "AWS::Region", "#/eventbus/default/rules/", !Ref ScheduledRule]]
+  SNSARN:
+    Description: This is the ARN of the SNS topic that was created for logging notification.
+    Value: !Ref SNSLogTopic
+  BUCKETNAME:
+    Description: This is the S3 Bucket where the Lambda Function packages are stored.
+    Value: !Ref LambdaZipsBucket
+  ONBOARDROLE:
+    Description: This is the IAM role created for the OnBoarding Function.
+    Value: !Ref SG2PLOnBoardRole
+  ONBOARDFUNCTION:
+    Description: This is the OnBoarding Lambda Function.
+    Value: !Ref SG2PLOnBoardFunction
+  BATCHSYNCROLE:
+    Description: This is the IAM role created for the Batch Sync Function.
+    Value: !Ref SG2PLBatchSyncRole
+  BATCHSYNCFUNCTION:
+    Description: This is the Batch Sync Lambda Function.
+    Value: !Ref SG2PLBatchSyncFunction
+  BULKBATCHINITIATORROLE:
+    Description: This is the IAM role created for the Bulk Batch Initiator Function.
+    Value: !Ref SG2PLBulkBatchInitiatorRole
+  BULKBATCHINITIATORFUNCTION:
+    Description: This is the Bulk Batch Initiator Lambda Function.
+    Value: !Ref SG2PLBulkBatchInitiatorFunction
+
