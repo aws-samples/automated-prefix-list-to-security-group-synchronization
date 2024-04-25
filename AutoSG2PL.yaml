@@ -31,7 +31,6 @@ Metadata:
         Parameters:
           - PercentSafeThresholdSGQuota
           - BaseSafeThresholdSGQuota
-          - CodeSourceBucket
       -
         Label:
           default: "Logging Configuration"
@@ -73,10 +72,6 @@ Parameters:
     Description: This is the interval at which the Bulk Batch Initiator Function is run. Please specify a numberic value and either minute, hour or day for 1 or minutes, hours or days for greater than 1. Auto Invocation is disabled by default on create and must be enabled manually.
     Default: "5 minutes"
     AllowedPattern: ^((1 (minute|hour|day))|(([2-9]|[1-9]([0-9]){1,2}) (minutes|hours|days)))$
-  CodeSourceBucket:
-    Default: autosg2pl
-    Description: This is the bucket where the Lambda ZIPs are copied from. The default "autosg2pl" is a public bucket with the latest version of the solution.
-    Type: String
 
 Resources:
   # SNS Topic for Error Notifications
@@ -119,14 +114,12 @@ Resources:
                 Action:
                   - s3:GetObject
                 Resource:
-                  - !Join [ "", [ "arn:aws:s3:::", !Ref CodeSourceBucket, "/*" ] ]
                   - !Join [ "", [ "arn:aws:s3:::", !Ref LambdaZipsBucket, "/*" ] ]
               - Sid: S3list
                 Effect: Allow
                 Action:
                   - s3:ListBucket
                 Resource:
-                  - !Join [ "", [ "arn:aws:s3:::", !Ref CodeSourceBucket ] ]
                   - !Join [ "", [ "arn:aws:s3:::", !Ref LambdaZipsBucket ] ]
               - Sid: S3Put
                 Effect: Allow
@@ -141,7 +134,7 @@ Resources:
     DependsOn: CopyRole
     Type: AWS::Lambda::Function
     Properties:
-      Description: Copies Lambda function zips from Source bucket to local bucket
+      Description: Copies Lambda function source from GitHub to local bucket
       Handler: index.lambda_handler
       Runtime: python3.8
       Role: !GetAtt CopyRole.Arn
@@ -152,6 +145,9 @@ Resources:
           import cfnresponse
           import threading
           import logging
+          import urllib.request
+          import zipfile
+
           def timeout(event, context):
               logging.error('Execution is about to time out, sending failure response to CloudFormation')
               cfnresponse.send(event, context, cfnresponse.FAILED, {}, None)
@@ -159,24 +155,36 @@ Resources:
               timer = threading.Timer((context.get_remaining_time_in_millis() / 1000.00) - 0.5, timeout, args=[event, context])
               timer.start()
               status = cfnresponse.SUCCESS
+
+              base_url = 'https://raw.githubusercontent.com/aws-samples/automated-prefix-list-to-security-group-synchronization/main/'
+
+              source_urls = {
+                'SG2PL-Batchsync.py' : 'SG2PL-Batch-Sync.zip',
+                'SG2PL-BulkBatchInitiator.py' : 'SG2PL-Bulk-Batch-Initiator.zip',
+                'SG2PL-Onboard.py' : 'SG2PL-Onboard.zip'
+              }
+
               try:
-                  s3_resource = boto3.resource('s3')
                   client = boto3.client('s3')
                   new_bucket_name = event['ResourceProperties']['DestBucket']
-                  bucket_to_copy = event['ResourceProperties']['CodeSourceBucket']
                   if event['RequestType'] == 'Create':
-                      for key in client.list_objects(Bucket=bucket_to_copy)['Contents']:
-                          files = key['Key']
-                          logging.info(files)
-                          copy_source = {'Bucket': bucket_to_copy,'Key': files}
-                          s3_resource.meta.client.copy(copy_source, new_bucket_name, files)
-                          logging.info(files)
+                      for python_file, zip_file in source_urls.items():
+                          link = base_url + python_file
+                          logging.info(python_file)
+                          content = urllib.request.urlopen(link).read()
+
+                          with zipfile.ZipFile(f"/tmp/{zip_file}", 'w') as myzip:
+                              myzip.writestr(python_file, content)
+
+                          client.upload_file(f"/tmp/{zip_file}", new_bucket_name, zip_file)
                   elif event['RequestType'] == 'Delete':
-                      for key in client.list_objects(Bucket=new_bucket_name)['Contents']:
-                          files = key['Key']
-                          logging.info(files)
-                          client.delete_object(Bucket=new_bucket_name, Key=files)
-                          logging.info(files)
+                      to_delete = client.list_objects(Bucket=new_bucket_name)
+                      if 'Contents' in to_delete:
+                        for key in to_delete['Contents']:
+                            files = key['Key']
+                            logging.info(files)
+                            client.delete_object(Bucket=new_bucket_name, Key=files)
+                            logging.info(files)
               except Exception as e:
                   logging.error('Exception: %s' % e, exc_info=True)
                   status = cfnresponse.FAILED
@@ -191,7 +199,6 @@ Resources:
     Properties:
       ServiceToken: !GetAtt CopyZipsFunction.Arn
       DestBucket: !Ref LambdaZipsBucket
-      CodeSourceBucket: !Ref CodeSourceBucket
 
   # Batch Sync Lambda IAM Role
   SG2PLBatchSyncRole:
