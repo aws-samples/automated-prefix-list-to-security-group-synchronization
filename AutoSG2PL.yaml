@@ -114,20 +114,20 @@ Resources:
                 Action:
                   - s3:GetObject
                 Resource:
-                  - !Join [ "", [ "arn:aws:s3:::", !Ref LambdaZipsBucket, "/*" ] ]
+                  - !Join [ "", [ "arn:", !Ref AWS::Partition, ":s3:::", !Ref LambdaZipsBucket, "/*" ] ]
               - Sid: S3list
                 Effect: Allow
                 Action:
                   - s3:ListBucket
                 Resource:
-                  - !Join [ "", [ "arn:aws:s3:::", !Ref LambdaZipsBucket ] ]
+                  - !Join [ "", [ "arn:", !Ref AWS::Partition, ":s3:::", !Ref LambdaZipsBucket ] ]
               - Sid: S3Put
                 Effect: Allow
                 Action:
                   - s3:PutObject
                   - s3:DeleteObject
                 Resource:
-                  - !Join [ "", [ "arn:aws:s3:::", !Ref LambdaZipsBucket, "/*" ] ]
+                  - !Join [ "", [ "arn:", !Ref AWS::Partition, ":s3:::", !Ref LambdaZipsBucket, "/*" ] ]
 
   # Lambda Function to move code from source S3 bucket to local bucket
   CopyZipsFunction:
@@ -237,7 +237,7 @@ Resources:
                 Action:
                   - 'logs:CreateLogStream'
                   - 'logs:PutLogEvents'
-                Resource: !Join ["", ["arn:aws:logs:*:*:log-group:/aws/lambda/AutoSG2PL-Batch-Sync:*"]]
+                Resource: !Join ["", ["arn:", !Ref AWS::Partition, ":logs:*:*:log-group:/aws/lambda/AutoSG2PL-Batch-Sync:*"]]
 
   # Batch Sync Lambda Function
   SG2PLBatchSyncFunction:
